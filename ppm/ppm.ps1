@@ -453,16 +453,40 @@ function Update-Plugin {
         return
     }
 
-    # No .git and no .monorepo.json — try monorepo fallback from spec or name
+    # No .git and no .monorepo.json — try to derive the source from $Spec.
+    # Parse optional '#branch' suffix and the spec shape.
+    $specBase = $Spec
+    $specBranch = $null
+    if ($specBase -and $specBase -match '^([^#]+)#(.+)$') {
+        $specBase = $Matches[1]
+        $specBranch = $Matches[2]
+    }
+
+    # 3-segment spec: explicit monorepo source, no MONOREPO_MAP needed.
+    if ($specBase -and $specBase -match '^([^/]+)/([^/]+)/([^/]+)$') {
+        $sOwner = $Matches[1]
+        $sRepo  = $Matches[2]
+        $sSubdir = $Matches[3]
+        $branchNote = if ($specBranch) { " branch '$specBranch'" } else { "" }
+        Write-Host "  Updating: $name (3-segment monorepo $sOwner/$sRepo$branchNote) ..." -ForegroundColor Cyan
+        if (Install-FromMonorepo -Org $sOwner -Name $sSubdir -TargetPath $PluginPath -Source "$sOwner/$sRepo" -Branch $specBranch) {
+            Write-Host "  Updated: $name" -ForegroundColor Green
+        } else {
+            Write-Host "  FAILED: $name - 3-segment update failed" -ForegroundColor Red
+        }
+        return
+    }
+
+    # 2-segment / bare-name fallback via MONOREPO_MAP
     $org = $null
-    if ($Spec -and $Spec -match '^([^/]+)/') { $org = $Matches[1] }
+    if ($specBase -and $specBase -match '^([^/]+)/') { $org = $Matches[1] }
     if (-not $org) {
         # Guess the org from known psmux plugin name patterns
         if ($name -match '^psmux-') { $org = 'psmux-plugins' }
     }
     if ($org -and $script:MONOREPO_MAP.ContainsKey($org)) {
         Write-Host "  Updating: $name (monorepo fallback) ..." -ForegroundColor Cyan
-        if (Install-FromMonorepo -Org $org -Name $name -TargetPath $PluginPath) {
+        if (Install-FromMonorepo -Org $org -Name $name -TargetPath $PluginPath -Branch $specBranch) {
             Write-Host "  Updated: $name" -ForegroundColor Green
         } else {
             Write-Host "  FAILED: $name - monorepo fallback failed" -ForegroundColor Red

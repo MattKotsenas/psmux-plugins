@@ -22,6 +22,12 @@ function Get-PsmuxBin {
 
 $PSMUX = Get-PsmuxBin
 
+# Plugin root (this file lives in <plugin>/scripts/)
+$PLUGIN_DIR = Split-Path $PSScriptRoot -Parent
+
+# Strategy mechanism: load helper for per-program restore strategies
+. (Join-Path $PSScriptRoot 'strategy.ps1')
+
 # --- Progress indicator helpers ---
 # A persistent message is exposed via the @resurrect-status user option so
 # users can render it in status-right with #{@resurrect-status}. We also
@@ -224,7 +230,13 @@ try {
             if ($restoreProcesses) {
                 foreach ($pane in $win.panes) {
                     if ($pane.command -and (Should-RestoreProcess $pane.command)) {
-                        & $PSMUX send-keys -t "${winTarget}.$($pane.index)" $pane.command Enter 2>&1 | Out-Null
+                        $paneDir = if ($pane.directory) { $pane.directory } else { $env:USERPROFILE }
+                        $sendCmd = Get-StrategyCommand `
+                            -OriginalCommand $pane.command `
+                            -Directory $paneDir `
+                            -PsmuxBin $PSMUX `
+                            -PluginDir $PLUGIN_DIR
+                        & $PSMUX send-keys -t "${winTarget}.$($pane.index)" $sendCmd Enter 2>&1 | Out-Null
                         Start-Sleep -Milliseconds 200
                     }
                 }

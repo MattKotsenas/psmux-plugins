@@ -102,7 +102,7 @@ function Get-DeclaredPlugins {
     $matches = [regex]::Matches($optsText, '@plugin\s+[''"]?([^''"]+)[''"]?')
     foreach ($m in $matches) {
         $val = $m.Groups[1].Value.Trim()
-        if ($val -and $val -ne 'psmux-plugins/ppm') {
+        if ($val) {
             $plugins += $val
         }
     }
@@ -121,7 +121,7 @@ function Get-DeclaredPlugins {
                 $cfgMatches = [regex]::Matches($content, "set\s+-g\s+@plugin\s+['""]([^'""]+)['""]")
                 foreach ($m in $cfgMatches) {
                     $val = $m.Groups[1].Value.Trim()
-                    if ($val -and $val -ne 'psmux-plugins/ppm' -and $val -notin $plugins) {
+                    if ($val -and $val -notin $plugins) {
                         $plugins += $val
                     }
                 }
@@ -571,8 +571,7 @@ function Update-AllPlugins {
         $specByName[$pname] = $spec
     }
 
-    $dirs = Get-ChildItem -Path $PLUGIN_DIR -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -ne 'ppm' }
+    $dirs = Get-ChildItem -Path $PLUGIN_DIR -Directory -ErrorAction SilentlyContinue
 
     if ($dirs.Count -eq 0) {
         Write-Host "  No plugins to update." -ForegroundColor DarkGray
@@ -603,6 +602,12 @@ function Remove-UnusedPlugins {
     Write-Host "PPM - Cleaning unused plugins..." -ForegroundColor Magenta
     Write-Host ("=" * 50) -ForegroundColor Magenta
 
+    # Skip the PPM directory itself when scanning for unused plugins. Matches
+    # tpm's pattern in scripts/clean_plugins.sh (`[ "${plugin}" = "tpm" ] && continue`):
+    # never remove the plugin manager regardless of whether the user has declared
+    # `set -g @plugin 'psmux-plugins/ppm'` in their config. If they removed that
+    # line, this guard prevents the clean pass from deleting the directory
+    # containing the currently-running script.
     $dirs = Get-ChildItem -Path $PLUGIN_DIR -Directory -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -ne 'ppm' }
 
@@ -663,6 +668,13 @@ Register-PPMBindings
 $declaredPlugins = Get-DeclaredPlugins
 $declaredNames = $declaredPlugins | ForEach-Object { ($_ -split '/')[-1] }
 
+# Source only plugins that are declared in config (not every directory).
+# The `$_.Name -ne 'ppm'` filter is a PPM-specific divergence from tpm: tpm
+# has no analogous startup-source loop (its plugin sourcing is integrated
+# into tpm.tmux's main script flow, so re-entry is impossible by design).
+# PPM runs sourcing as a separate pass after bootstrap, so the guard prevents
+# PPM from re-sourcing itself when the user has declared
+# `set -g @plugin 'psmux-plugins/ppm'` in their config.
 $installedPlugins = Get-ChildItem -Path $PLUGIN_DIR -Directory -ErrorAction SilentlyContinue |
                     Where-Object { $_.Name -ne 'ppm' -and $_.Name -in $declaredNames }
 

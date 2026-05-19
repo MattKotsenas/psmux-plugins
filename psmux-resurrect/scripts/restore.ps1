@@ -13,9 +13,13 @@ $ErrorActionPreference = 'Continue'
 $env:PSMUX_ALLOW_NESTING = '1'
 
 function Get-PsmuxBin {
+    # Test-mode override: env var pointing to a wrapper script/exe to use
+    # instead of the discovered binary. Lets isolation tests redirect every
+    # psmux invocation to a wrapper that adds -L <test-socket>.
+    if ($env:PSMUX_BIN_OVERRIDE) { return $env:PSMUX_BIN_OVERRIDE }
     foreach ($n in @('psmux','pmux','tmux')) {
         $b = Get-Command $n -ErrorAction SilentlyContinue
-        if ($b) { return $b.Source }
+        if ($b -and $b.Source) { return $b.Source }
     }
     return 'psmux'
 }
@@ -146,12 +150,34 @@ try {
 
         Show-Progress -current ($si + 1) -total $totalSessions -sessionName $sessionName
 
-        # Check if session already exists (idempotent)
+        # Check if session already exists. The original behavior was to skip
+        # entirely, which lost data on psmux server startup: the server
+        # creates a default empty session, this script saw it existed, and
+        # `continue`'d past all the saved windows. Refactor to pane-level
+        # reconciliation: when the existing session is the empty default
+        # (exactly 1 window with 1 pane — no user state to preserve), reuse
+        # it as the target for the saved content. Only when the session has
+        # actual user state (multiple windows OR multiple panes) do we skip.
+        $reuseExisting = $false
         $null = & $PSMUX has-session -t $sessionName 2>&1
         if ($LASTEXITCODE -eq 0) {
-            Write-Host "  Session '$sessionName' already exists, skipping" -ForegroundColor Yellow
-            $skipped += $sessionName
-            continue
+            # Session exists. Inspect its content to decide reuse vs. skip.
+            $existingWindowsRaw = & $PSMUX list-windows -t $sessionName -F '#{window_index}' 2>&1
+            $existingWindows = @($existingWindowsRaw | Where-Object { $_ -match '^\d+$' })
+            $existingPanesRaw = & $PSMUX list-panes -t $sessionName -F '#{pane_index}' 2>&1
+            $existingPanes = @($existingPanesRaw | Where-Object { $_ -match '^\d+$' })
+
+            if ($existingWindows.Count -eq 1 -and $existingPanes.Count -eq 1) {
+                # Empty default state (one window, one pane — the
+                # auto-created shell with nothing in it). Safe to reuse.
+                $reuseExisting = $true
+                Write-Host "  Session '$sessionName' is empty default; reusing for restore" -ForegroundColor DarkGray
+            } else {
+                # User has been working in this session; preserve their state.
+                Write-Host "  Session '$sessionName' has user state ($($existingWindows.Count) windows, $($existingPanes.Count) panes total); skipping" -ForegroundColor Yellow
+                $skipped += $sessionName
+                continue
+            }
         }
 
         # Create session with first window
@@ -162,20 +188,32 @@ try {
             $env:USERPROFILE
         }
 
-        # Use the saved window name for the initial window
-        & $PSMUX new-session -d -s $sessionName -c $firstDir $(if ($firstWindow.name) { @('-n', $firstWindow.name) } else { @() }) 2>&1 | Out-Null
+        if ($reuseExisting) {
+            # Reuse existing session: don't create, just rename the existing
+            # window to match the saved name and use it as the first window.
+            if ($firstWindow.name) {
+                # Determine the existing window index, then rename it.
+                $existingWinIdx = (& $PSMUX list-windows -t $sessionName -F '#{window_index}' 2>&1 | Out-String).Trim()
+                if ($existingWinIdx -match '^\d+$') {
+                    & $PSMUX rename-window -t "${sessionName}:${existingWinIdx}" $firstWindow.name 2>&1 | Out-Null
+                }
+            }
+        } else {
+            # Use the saved window name for the initial window
+            & $PSMUX new-session -d -s $sessionName -c $firstDir $(if ($firstWindow.name) { @('-n', $firstWindow.name) } else { @() }) 2>&1 | Out-Null
 
-        # Wait for session to be ready
-        $ready = $false
-        for ($w = 0; $w -lt 40; $w++) {
-            Start-Sleep -Milliseconds 250
-            $null = & $PSMUX has-session -t $sessionName 2>&1
-            if ($LASTEXITCODE -eq 0) { $ready = $true; break }
-        }
-        if (-not $ready) {
-            Write-Host "  Failed to create session '$sessionName'" -ForegroundColor Red
-            $failed += $sessionName
-            continue
+            # Wait for session to be ready
+            $ready = $false
+            for ($w = 0; $w -lt 40; $w++) {
+                Start-Sleep -Milliseconds 250
+                $null = & $PSMUX has-session -t $sessionName 2>&1
+                if ($LASTEXITCODE -eq 0) { $ready = $true; break }
+            }
+            if (-not $ready) {
+                Write-Host "  Failed to create session '$sessionName'" -ForegroundColor Red
+                $failed += $sessionName
+                continue
+            }
         }
 
         # Get the actual base index used by the new session

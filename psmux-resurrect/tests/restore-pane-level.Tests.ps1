@@ -282,4 +282,96 @@ Describe 'Pane-level reconciliation' {
             CountWindows -SessionName 'main' | Should -Be 1
         }
     }
+
+    Context 'When invoked concurrently (defense against auto_restore TOCTOU)' {
+        # See psmux-plugins#NN: auto_restore.ps1 uses an option-based TOCTOU
+        # singleton (`@continuum-restore-fired`) that fails to prevent two
+        # restore.ps1 invocations from racing when session-created hooks fire
+        # near-simultaneously at server boot. Even with that fixed upstream,
+        # restore.ps1 itself should be idempotent under concurrent invocation
+        # so a user binding, a future hook, or a manual `psmux run -b` can't
+        # produce the doubled-windows bug.
+        #
+        # This test reproduces the field-observed pattern: 4-window save +
+        # two concurrent restores → expected 4 windows, observed 7 (the
+        # first window is reused by both invocations but subsequent windows
+        # get appended by each independently).
+
+        BeforeEach {
+            StartFreshServer -SessionName 'main'
+        }
+
+        It 'Two concurrent restore.ps1 invocations produce one set of windows, not two' {
+            $sessions = @(
+                [pscustomobject]@{
+                    name    = 'main'
+                    windows = @(
+                        [pscustomobject]@{
+                            index = 1; name = 'w1'; active = $true
+                            panes = @([pscustomobject]@{ index = 1; active = $true; directory = $env:USERPROFILE; command = 'pwsh' })
+                        },
+                        [pscustomobject]@{
+                            index = 2; name = 'w2'
+                            panes = @([pscustomobject]@{ index = 1; active = $true; directory = $env:USERPROFILE; command = 'pwsh' })
+                        },
+                        [pscustomobject]@{
+                            index = 3; name = 'w3'
+                            panes = @([pscustomobject]@{ index = 1; active = $true; directory = $env:USERPROFILE; command = 'pwsh' })
+                        },
+                        [pscustomobject]@{
+                            index = 4; name = 'w4'
+                            panes = @([pscustomobject]@{ index = 1; active = $true; directory = $env:USERPROFILE; command = 'pwsh' })
+                        }
+                    )
+                }
+            )
+            WriteSaveJson $sessions | Out-Null
+
+            # Set up the test environment once so both child pwsh processes
+            # use the same wrapper + resurrect dir.
+            & psmux -L $script:TestSocket set-option -g '@resurrect-dir' $script:TestResurrectDir 2>&1 | Out-Null
+            $realPsmux = (Get-Command psmux -EA SilentlyContinue).Source
+            $wrapperDir = Join-Path $env:TEMP 'psmux-test-wrapper'
+            if (-not (Test-Path $wrapperDir)) {
+                New-Item -ItemType Directory -Path $wrapperDir -Force | Out-Null
+            }
+            $wrapper = Join-Path $wrapperDir 'psmux-test-wrapper.cmd'
+            $sock = $script:TestSocket
+            @"
+@echo off
+`"$realPsmux`" -L "$sock" %*
+"@ | Set-Content $wrapper
+
+            $rs = $script:RestoreScript
+            $pidFileOverride = Join-Path $env:TEMP 'psmux-test-restore.pid'
+            Remove-Item $pidFileOverride -EA SilentlyContinue
+
+            # Launch two concurrent restore.ps1 processes via PowerShell jobs.
+            $job1 = Start-Job -ScriptBlock {
+                param($s, $w, $p)
+                $env:PSMUX_BIN_OVERRIDE = $w
+                $env:PSMUX_ALLOW_NESTING = '1'
+                $env:PSMUX_RESTORE_PID_FILE_OVERRIDE = $p
+                & pwsh -NoProfile -File $s 2>&1
+            } -ArgumentList $rs, $wrapper, $pidFileOverride
+
+            $job2 = Start-Job -ScriptBlock {
+                param($s, $w, $p)
+                $env:PSMUX_BIN_OVERRIDE = $w
+                $env:PSMUX_ALLOW_NESTING = '1'
+                $env:PSMUX_RESTORE_PID_FILE_OVERRIDE = $p
+                & pwsh -NoProfile -File $s 2>&1
+            } -ArgumentList $rs, $wrapper, $pidFileOverride
+
+            Wait-Job $job1, $job2 -Timeout 60 | Out-Null
+            Remove-Job $job1, $job2 -Force
+
+            CountWindows -SessionName 'main' | Should -Be 4 -Because 'concurrent restore must not duplicate windows; one set of 4 windows is the correct answer'
+            $names = @(GetWindowNames -SessionName 'main')
+            ($names | Where-Object { $_ -eq 'w1' }).Count | Should -Be 1 -Because 'w1 must appear exactly once'
+            ($names | Where-Object { $_ -eq 'w2' }).Count | Should -Be 1 -Because 'w2 must appear exactly once'
+            ($names | Where-Object { $_ -eq 'w3' }).Count | Should -Be 1 -Because 'w3 must appear exactly once'
+            ($names | Where-Object { $_ -eq 'w4' }).Count | Should -Be 1 -Because 'w4 must appear exactly once'
+        }
+    }
 }

@@ -26,6 +26,93 @@ function Get-PsmuxBin {
 
 $PSMUX = Get-PsmuxBin
 
+# --- Singleton guard -------------------------------------------------------
+# Restore is a long-running, NON-idempotent operation: it issues new-window
+# calls for each saved window. Concurrent invocations interleave their
+# new-window calls and double (or worse) the resulting window count.
+#
+# This is observable in the wild because:
+#   * psmux-continuum's session-created hook fires for every new-session,
+#     including the ones THIS script issues. Its option-based TOCTOU
+#     singleton (@continuum-restore-fired) can let two auto_restore.ps1
+#     invocations through under tight timing at server boot.
+#   * Future user hooks / manual bindings can also re-enter.
+#
+# Process-level PID-file singleton matches the auto_save.ps1 approach
+# (psmux-plugins#13 / Cosmin's fix). Atomic CreateNew on the PID file
+# guarantees that exactly one restore loop ever proceeds at a time; any
+# concurrent invocations exit cleanly without touching state.
+#
+# Test override: PSMUX_RESTORE_PID_FILE_OVERRIDE lets the Pester test suite
+# point at a tempdir-local PID file so we don't collide with a real plugin
+# install on the same machine.
+$RESTORE_PID_FILE = if ($env:PSMUX_RESTORE_PID_FILE_OVERRIDE) {
+    $env:PSMUX_RESTORE_PID_FILE_OVERRIDE
+} else {
+    Join-Path $env:LOCALAPPDATA 'psmux-continuum\restore.pid'
+}
+$pidDir = Split-Path $RESTORE_PID_FILE -Parent
+if (-not (Test-Path $pidDir)) {
+    New-Item -ItemType Directory -Path $pidDir -Force | Out-Null
+}
+
+# Atomic claim: try to create the file with CreateNew. If it exists and
+# the recorded PID is still alive, another restore is in progress; exit.
+# If it exists but the recorded PID is dead, the slot is stale (previous
+# restore crashed) — reclaim it.
+$claimedSlot = $false
+$ownPid = $PID
+try {
+    $fs = [System.IO.File]::Open(
+        $RESTORE_PID_FILE,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::Read
+    )
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($ownPid.ToString())
+        $fs.Write($bytes, 0, $bytes.Length)
+    } finally {
+        $fs.Dispose()
+    }
+    $claimedSlot = $true
+} catch [System.IO.IOException] {
+    # File already exists. Inspect the recorded PID to decide whether to
+    # take over the slot (stale) or back off (live).
+    $stalePid = $null
+    try { $stalePid = [int]((Get-Content $RESTORE_PID_FILE -Raw).Trim()) } catch {}
+    if ($stalePid -and (Get-Process -Id $stalePid -EA SilentlyContinue)) {
+        Write-Host "psmux-resurrect: another restore is already running (PID $stalePid); exiting." -ForegroundColor DarkGray
+        exit 0
+    }
+    # Stale slot — try to reclaim it.
+    try {
+        Set-Content -Path $RESTORE_PID_FILE -Value $ownPid -NoNewline -ErrorAction Stop
+        $claimedSlot = $true
+    } catch {
+        Write-Host "psmux-resurrect: could not reclaim stale singleton slot; exiting." -ForegroundColor DarkGray
+        exit 0
+    }
+}
+
+# Ensure we release the slot on any exit path (success, error, ctrl-C).
+$releaseSlot = {
+    if ($claimedSlot -and (Test-Path $RESTORE_PID_FILE)) {
+        # Only delete if we're still the owner (PID matches). If someone
+        # else claimed it after we set up but before we got here, leave
+        # their claim alone.
+        try {
+            $currentOwner = [int]((Get-Content $RESTORE_PID_FILE -Raw).Trim())
+            if ($currentOwner -eq $ownPid) {
+                Remove-Item $RESTORE_PID_FILE -Force -ErrorAction SilentlyContinue
+            }
+        } catch {
+            Remove-Item $RESTORE_PID_FILE -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+# --- End singleton guard ---------------------------------------------------
+
 # --- Progress indicator helpers ---
 # A persistent message is exposed via the @resurrect-status user option so
 # users can render it in status-right with #{@resurrect-status}. We also
@@ -335,4 +422,5 @@ try {
 finally {
     Clear-ResurrectStatus
     & $PSMUX refresh-client -S 2>&1 | Out-Null
+    & $releaseSlot
 }

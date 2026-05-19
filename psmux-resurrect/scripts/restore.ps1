@@ -59,40 +59,65 @@ if (-not (Test-Path $pidDir)) {
 # Atomic claim: try to create the file with CreateNew. If it exists and
 # the recorded PID is still alive, another restore is in progress; exit.
 # If it exists but the recorded PID is dead, the slot is stale (previous
-# restore crashed) — reclaim it.
+# restore crashed) — reclaim atomically by deleting + retrying CreateNew.
+# Bounded retries so we don't spin if two processes are both trying to
+# reclaim the same dead slot (the second one will see the first's live PID
+# on its second pass and exit cleanly).
 $claimedSlot = $false
 $ownPid = $PID
-try {
-    $fs = [System.IO.File]::Open(
-        $RESTORE_PID_FILE,
-        [System.IO.FileMode]::CreateNew,
-        [System.IO.FileAccess]::Write,
-        [System.IO.FileShare]::Read
-    )
+$MaxClaimAttempts = 3
+for ($attempt = 0; $attempt -lt $MaxClaimAttempts; $attempt++) {
     try {
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($ownPid.ToString())
-        $fs.Write($bytes, 0, $bytes.Length)
-    } finally {
-        $fs.Dispose()
-    }
-    $claimedSlot = $true
-} catch [System.IO.IOException] {
-    # File already exists. Inspect the recorded PID to decide whether to
-    # take over the slot (stale) or back off (live).
-    $stalePid = $null
-    try { $stalePid = [int]((Get-Content $RESTORE_PID_FILE -Raw).Trim()) } catch {}
-    if ($stalePid -and (Get-Process -Id $stalePid -EA SilentlyContinue)) {
-        Write-Host "psmux-resurrect: another restore is already running (PID $stalePid); exiting." -ForegroundColor DarkGray
-        exit 0
-    }
-    # Stale slot — try to reclaim it.
-    try {
-        Set-Content -Path $RESTORE_PID_FILE -Value $ownPid -NoNewline -ErrorAction Stop
+        $fs = [System.IO.File]::Open(
+            $RESTORE_PID_FILE,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::Read
+        )
+        try {
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($ownPid.ToString())
+            $fs.Write($bytes, 0, $bytes.Length)
+        } finally {
+            $fs.Dispose()
+        }
         $claimedSlot = $true
-    } catch {
-        Write-Host "psmux-resurrect: could not reclaim stale singleton slot; exiting." -ForegroundColor DarkGray
-        exit 0
+        break
+    } catch [System.IO.IOException] {
+        # File already exists. Inspect the recorded PID.
+        $stalePid = $null
+        try { $stalePid = [int]((Get-Content $RESTORE_PID_FILE -Raw).Trim()) } catch {}
+
+        # Verify the recorded PID belongs to a pwsh process (the only thing
+        # that should be running restore.ps1). PIDs are reused on Windows;
+        # a bare Get-Process check can false-positive when the kernel has
+        # recycled the PID to a different process. Checking the image name
+        # narrows the window dramatically.
+        $aliveOwner = $null
+        if ($stalePid) {
+            $proc = Get-Process -Id $stalePid -EA SilentlyContinue
+            if ($proc -and ($proc.Name -in @('pwsh', 'powershell'))) {
+                $aliveOwner = $proc
+            }
+        }
+        if ($aliveOwner) {
+            Write-Host "psmux-resurrect: another restore is already running (PID $stalePid); exiting." -ForegroundColor DarkGray
+            exit 0
+        }
+        # Stale slot — delete and retry CreateNew. The delete + retry pattern
+        # avoids the TOCTOU race on Set-Content: if another process is also
+        # reclaiming, only one will succeed at CreateNew; the other will see
+        # the first's live PID on the next iteration and exit.
+        try {
+            Remove-Item $RESTORE_PID_FILE -Force -ErrorAction Stop
+        } catch {
+            # Someone else may have just deleted it; loop will retry CreateNew.
+        }
+        Start-Sleep -Milliseconds 25
     }
+}
+if (-not $claimedSlot) {
+    Write-Host "psmux-resurrect: could not claim singleton slot after $MaxClaimAttempts attempts; exiting." -ForegroundColor DarkGray
+    exit 0
 }
 
 # Ensure we release the slot on any exit path (success, error, ctrl-C).

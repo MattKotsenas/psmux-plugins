@@ -108,11 +108,17 @@ BeforeAll {
 `"$realPsmux`" -L "$sock" %*
 "@ | Set-Content $wrapper
 
-        # Invoke restore.ps1 in a child pwsh with the override env var set.
+        # Use a test-scoped PID file path so the singleton in restore.ps1 doesn't
+        # interfere across serial test invocations (each test gets a fresh slot).
+        $pidFile = Join-Path $env:TEMP 'psmux-test-restore-default.pid'
+        Remove-Item $pidFile -EA SilentlyContinue
+
+        # Invoke restore.ps1 in a child pwsh with the override env vars set.
         $rs = $script:RestoreScript
         $invocation = @"
 `$env:PSMUX_ALLOW_NESTING = '1'
 `$env:PSMUX_BIN_OVERRIDE = '$wrapper'
+`$env:PSMUX_RESTORE_PID_FILE_OVERRIDE = '$pidFile'
 & '$rs'
 "@
         pwsh -NoProfile -NoLogo -Command $invocation
@@ -372,6 +378,72 @@ Describe 'Pane-level reconciliation' {
             ($names | Where-Object { $_ -eq 'w2' }).Count | Should -Be 1 -Because 'w2 must appear exactly once'
             ($names | Where-Object { $_ -eq 'w3' }).Count | Should -Be 1 -Because 'w3 must appear exactly once'
             ($names | Where-Object { $_ -eq 'w4' }).Count | Should -Be 1 -Because 'w4 must appear exactly once'
+        }
+
+        It 'Two concurrent restore.ps1 invocations against a STALE PID file still produce one set of windows' {
+            # Reclaim path: when a previous restore crashed without releasing
+            # the PID file, the next invocation must atomically reclaim. Two
+            # concurrent invocations both seeing the same stale PID is the
+            # specific TOCTOU window I want to guard.
+            $sessions = @(
+                [pscustomobject]@{
+                    name    = 'main'
+                    windows = @(
+                        [pscustomobject]@{ index=1; name='w1'; active=$true; panes=@([pscustomobject]@{index=1; active=$true; directory=$env:USERPROFILE; command='pwsh'}) },
+                        [pscustomobject]@{ index=2; name='w2'; panes=@([pscustomobject]@{index=1; active=$true; directory=$env:USERPROFILE; command='pwsh'}) },
+                        [pscustomobject]@{ index=3; name='w3'; panes=@([pscustomobject]@{index=1; active=$true; directory=$env:USERPROFILE; command='pwsh'}) },
+                        [pscustomobject]@{ index=4; name='w4'; panes=@([pscustomobject]@{index=1; active=$true; directory=$env:USERPROFILE; command='pwsh'}) }
+                    )
+                }
+            )
+            WriteSaveJson $sessions | Out-Null
+
+            & psmux -L $script:TestSocket set-option -g '@resurrect-dir' $script:TestResurrectDir 2>&1 | Out-Null
+            $realPsmux = (Get-Command psmux -EA SilentlyContinue).Source
+            $wrapperDir = Join-Path $env:TEMP 'psmux-test-wrapper'
+            if (-not (Test-Path $wrapperDir)) {
+                New-Item -ItemType Directory -Path $wrapperDir -Force | Out-Null
+            }
+            $wrapper = Join-Path $wrapperDir 'psmux-test-wrapper.cmd'
+            $sock = $script:TestSocket
+            @"
+@echo off
+`"$realPsmux`" -L "$sock" %*
+"@ | Set-Content $wrapper
+
+            $rs = $script:RestoreScript
+            $pidFileOverride = Join-Path $env:TEMP 'psmux-test-restore-stale.pid'
+
+            # Plant a STALE PID file with an obviously-dead PID. Both
+            # concurrent invocations will see this on entry and try to reclaim.
+            # The atomic delete+CreateNew pattern must guarantee only one wins.
+            Set-Content -Path $pidFileOverride -Value '999999' -NoNewline
+
+            $job1 = Start-Job -ScriptBlock {
+                param($s, $w, $p)
+                $env:PSMUX_BIN_OVERRIDE = $w
+                $env:PSMUX_ALLOW_NESTING = '1'
+                $env:PSMUX_RESTORE_PID_FILE_OVERRIDE = $p
+                & pwsh -NoProfile -File $s 2>&1
+            } -ArgumentList $rs, $wrapper, $pidFileOverride
+
+            $job2 = Start-Job -ScriptBlock {
+                param($s, $w, $p)
+                $env:PSMUX_BIN_OVERRIDE = $w
+                $env:PSMUX_ALLOW_NESTING = '1'
+                $env:PSMUX_RESTORE_PID_FILE_OVERRIDE = $p
+                & pwsh -NoProfile -File $s 2>&1
+            } -ArgumentList $rs, $wrapper, $pidFileOverride
+
+            Wait-Job $job1, $job2 -Timeout 60 | Out-Null
+            Remove-Job $job1, $job2 -Force
+
+            CountWindows -SessionName 'main' | Should -Be 4 -Because 'reclaim-then-concurrent must still produce exactly one set of windows'
+            $names = @(GetWindowNames -SessionName 'main')
+            ($names | Where-Object { $_ -eq 'w1' }).Count | Should -Be 1
+            ($names | Where-Object { $_ -eq 'w2' }).Count | Should -Be 1
+            ($names | Where-Object { $_ -eq 'w3' }).Count | Should -Be 1
+            ($names | Where-Object { $_ -eq 'w4' }).Count | Should -Be 1
         }
     }
 }

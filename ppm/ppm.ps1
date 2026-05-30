@@ -220,12 +220,19 @@ function Install-FromMonorepo {
         return $false
     }
 
-    # Copy the subdirectory to the target location
+    # Copy the subdirectory contents to the target location.
     # If target already exists (update scenario), clean old content first
+    # but preserve the .monorepo.json marker.
     if (Test-Path $TargetPath) {
         Get-ChildItem -Path $TargetPath -Exclude '.monorepo.json' | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    } else {
+        New-Item -ItemType Directory -Path $TargetPath -Force | Out-Null
     }
-    Copy-Item -Path $subDir -Destination $TargetPath -Recurse -Force
+    # Copy the contents of $subDir (not the directory itself) into $TargetPath.
+    # Using `Copy-Item -Path $subDir -Destination $TargetPath -Recurse` when
+    # $TargetPath already exists nests $subDir as a child (~/.psmux/plugins/<name>/<name>/),
+    # which breaks plugin loading. Enumerate children to merge instead.
+    Get-ChildItem -Path $subDir -Force | Copy-Item -Destination $TargetPath -Recurse -Force
 
     # Create a .monorepo marker so Update-Plugin knows how to update this.
     # The optional 'branch' field is persisted only when a branch was specified

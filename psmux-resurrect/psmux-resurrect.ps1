@@ -24,6 +24,7 @@
 #   set -g @resurrect-processes 'ssh python node'
 #   set -g @resurrect-processes 'false'           # disable process restore
 #   set -g @resurrect-processes ':all:'           # restore all (dangerous)
+#   set -g @resurrect-strategy-<prog> '<name>'    # per-program restore strategy
 # =============================================================================
 
 $ErrorActionPreference = 'Continue'

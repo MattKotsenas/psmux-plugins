@@ -14,6 +14,10 @@ function Get-PsmuxBin {
 
 $PSMUX = Get-PsmuxBin
 
+# Plugin root (this file lives in <plugin>/scripts/) + save-command strategy helper
+$PLUGIN_DIR = Split-Path $PSScriptRoot -Parent
+. (Join-Path $PSScriptRoot 'save_strategy.ps1')
+
 # Resolve save directory (support @resurrect-dir option)
 $RESURRECT_DIR = Join-Path $env:USERPROFILE '.psmux\resurrect'
 try {
@@ -91,18 +95,25 @@ foreach ($line in ($sessionLines -split "`n")) {
         }
 
         # Get panes: index, path, active, title, current_command
-        $paneFmt = '#{pane_index}|#{pane_current_path}|#{pane_active}|#{pane_title}|#{pane_current_command}'
+        $paneFmt = '#{pane_index}|#{pane_current_path}|#{pane_active}|#{pane_title}|#{pane_current_command}|#{pane_pid}'
         $paneLines = (& $PSMUX list-panes -t "${sessionName}:${winIndex}" -F $paneFmt 2>&1) | Out-String
         foreach ($pline in ($paneLines -split "`n")) {
             $pline = $pline.Trim()
             if ([string]::IsNullOrWhiteSpace($pline)) { continue }
 
-            $pParts = $pline -split '\|', 5
+            $pParts = $pline -split '\|', 6
             $paneIdx  = if ($pParts.Count -ge 1) { [int]$pParts[0] } else { 0 }
             $paneDir  = if ($pParts.Count -ge 2 -and $pParts[1]) { $pParts[1] } else { $env:USERPROFILE }
             $paneAct  = if ($pParts.Count -ge 3) { $pParts[2] } else { '0' }
             $paneTtl  = if ($pParts.Count -ge 4) { $pParts[3] } else { '' }
             $paneCmd  = if ($pParts.Count -ge 5) { $pParts[4] } else { '' }
+            $panePid  = if ($pParts.Count -ge 6) { $pParts[5] } else { '' }
+
+            # Resolve the command to persist via the optional global
+            # save-command strategy (@resurrect-save-command-strategy).
+            # Default (unset): the bare pane_current_command.
+            $paneCmd = Get-SaveCommand -PaneCommand $paneCmd -PanePid $panePid `
+                -Directory $paneDir -PsmuxBin $PSMUX -PluginDir $PLUGIN_DIR
 
             $paneData = @{
                 index     = $paneIdx

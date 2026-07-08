@@ -19,11 +19,18 @@
 $ErrorActionPreference = 'Continue'
 
 # --- Monorepo mapping ---
-# Maps GitHub "org" prefixes to actual monorepo owner/repo.
-# When a plugin spec like 'psmux-plugins/<name>' is used, PPM first tries
-# to clone it as an individual repo. If that fails (because psmux-plugins is
-# not a real GitHub org), it falls back to cloning the monorepo and extracting
-# the <name> subdirectory.
+# Maps GitHub "org" prefixes to actual monorepo owner/repo, as a maintainer-curated
+# registry of well-known shorthands. When a plugin spec like 'psmux-plugins/<name>'
+# is used, PPM first tries to clone it as an individual repo. If that fails (because
+# psmux-plugins is not a real GitHub org), it falls back to cloning the monorepo and
+# extracting the <name> subdirectory.
+#
+# Users who want to install from any other monorepo (e.g. a fork) can use the
+# self-describing 3-segment form without touching this map:
+#   set -g @plugin 'owner/monorepo/subdir'
+# Optionally with a branch suffix (TPM-compatible):
+#   set -g @plugin 'owner/monorepo/subdir#branch'
+#   set -g @plugin 'owner/repo#branch'
 $script:MONOREPO_MAP = @{
     'psmux-plugins' = 'psmux/psmux-plugins'
 }
@@ -95,7 +102,7 @@ function Get-DeclaredPlugins {
     $matches = [regex]::Matches($optsText, '@plugin\s+[''"]?([^''"]+)[''"]?')
     foreach ($m in $matches) {
         $val = $m.Groups[1].Value.Trim()
-        if ($val -and $val -ne 'psmux-plugins/ppm') {
+        if ($val) {
             $plugins += $val
         }
     }
@@ -114,7 +121,7 @@ function Get-DeclaredPlugins {
                 $cfgMatches = [regex]::Matches($content, "set\s+-g\s+@plugin\s+['""]([^'""]+)['""]")
                 foreach ($m in $cfgMatches) {
                     $val = $m.Groups[1].Value.Trim()
-                    if ($val -and $val -ne 'psmux-plugins/ppm' -and $val -notin $plugins) {
+                    if ($val -and $val -notin $plugins) {
                         $plugins += $val
                     }
                 }
@@ -127,23 +134,47 @@ function Get-DeclaredPlugins {
 }
 
 # --- Resolve plugin spec to git URL and local path ---
+# Supported spec shapes (each may have an optional '#branch' suffix):
+#   https://...                URL clone direct
+#   git@...                    URL clone direct (SSH)
+#   owner/monorepo/subdir      3-segment: clone owner/monorepo, extract subdir
+#   owner/repo                 2-segment: clone owner/repo (with MONOREPO_MAP fallback)
+#   name                       bare name: assumed under psmux-plugins org
 function Resolve-PluginSpec {
     param([string]$Spec)
-    $name = $Spec.Split('/')[-1]
-    $localPath = Join-Path $PLUGIN_DIR $name
 
-    if ($Spec -match '^https?://') {
-        # Full URL
-        return @{ Name = $name; Url = $Spec; Path = $localPath; Org = $null }
+    # Parse optional '#branch' suffix (TPM-compatible: split on first '#').
+    $branch = $null
+    if ($Spec -match '^([^#]+)#(.+)$') {
+        $Spec = $Matches[1]
+        $branch = $Matches[2]
+    }
+
+    if ($Spec -match '^https?://' -or $Spec -match '^git@') {
+        # Full URL: derive name from the final path segment, stripping .git
+        $name = (($Spec -split '[/:]')[-1]) -replace '\.git$',''
+        $localPath = Join-Path $PLUGIN_DIR $name
+        return @{ Name = $name; Url = $Spec; Path = $localPath; Org = $null; Branch = $branch; MonorepoSource = $null; SubdirName = $null }
+    }
+    elseif ($Spec -match '^([^/]+)/([^/]+)/([^/]+)$') {
+        # 3-segment: owner/monorepo/subdir - explicit monorepo extraction.
+        $owner    = $Matches[1]
+        $monorepo = $Matches[2]
+        $subdir   = $Matches[3]
+        $localPath = Join-Path $PLUGIN_DIR $subdir
+        return @{ Name = $subdir; Url = "https://github.com/$owner/$monorepo.git"; Path = $localPath; Org = $owner; Branch = $branch; MonorepoSource = "$owner/$monorepo"; SubdirName = $subdir }
     }
     elseif ($Spec -match '^([^/]+)/([^/]+)$') {
-        # GitHub short form: owner/repo
+        # 2-segment: GitHub owner/repo shorthand.
         $org = $Matches[1]
-        return @{ Name = $name; Url = "https://github.com/$Spec.git"; Path = $localPath; Org = $org }
+        $name = $Matches[2]
+        $localPath = Join-Path $PLUGIN_DIR $name
+        return @{ Name = $name; Url = "https://github.com/$Spec.git"; Path = $localPath; Org = $org; Branch = $branch; MonorepoSource = $null; SubdirName = $null }
     }
     else {
-        # Just a name, assume psmux-plugins org
-        return @{ Name = $Spec; Url = "https://github.com/psmux-plugins/$Spec.git"; Path = $localPath; Org = 'psmux-plugins' }
+        # Bare name: assume psmux-plugins org.
+        $localPath = Join-Path $PLUGIN_DIR $Spec
+        return @{ Name = $Spec; Url = "https://github.com/psmux-plugins/$Spec.git"; Path = $localPath; Org = 'psmux-plugins'; Branch = $branch; MonorepoSource = $null; SubdirName = $null }
     }
 }
 
@@ -151,17 +182,32 @@ function Resolve-PluginSpec {
 # When the individual repo clone fails and the org is in MONOREPO_MAP,
 # clone the full monorepo to a temp directory and extract just the
 # subdirectory for the requested plugin.
+#
+# 3-segment specs (owner/monorepo/subdir) call into this function with
+# $Source set explicitly, bypassing the MONOREPO_MAP lookup.
+# $Branch (if set) is passed to git clone --branch.
 function Install-FromMonorepo {
-    param([string]$Org, [string]$Name, [string]$TargetPath)
-    $monorepo = $script:MONOREPO_MAP[$Org]
+    param(
+        [string]$Org,
+        [string]$Name,
+        [string]$TargetPath,
+        [string]$Source,
+        [string]$Branch
+    )
+    # Resolve monorepo source: explicit $Source takes precedence over the map.
+    $monorepo = if ($Source) { $Source } else { $script:MONOREPO_MAP[$Org] }
     if (-not $monorepo) { return $false }
 
     $cloneUrl = "https://github.com/$monorepo.git"
     $tmpDir = Join-Path $env:TEMP "ppm-monorepo-$Org-$(Get-Random)"
 
-    Write-Host "  Trying monorepo ($monorepo) ..." -ForegroundColor DarkCyan
+    $branchNote = if ($Branch) { " branch '$Branch'" } else { "" }
+    Write-Host "  Trying monorepo ($monorepo)$branchNote ..." -ForegroundColor DarkCyan
+    $cloneArgs = @('clone', '--depth', '1')
+    if ($Branch) { $cloneArgs += @('--branch', $Branch) }
+    $cloneArgs += @($cloneUrl, $tmpDir)
     try {
-        git clone --depth 1 $cloneUrl $tmpDir 2>&1 | Out-Null
+        & git @cloneArgs 2>&1 | Out-Null
     } catch {
         if (Test-Path $tmpDir) { Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue }
         return $false
@@ -174,20 +220,31 @@ function Install-FromMonorepo {
         return $false
     }
 
-    # Copy the subdirectory to the target location
+    # Copy the subdirectory contents to the target location.
     # If target already exists (update scenario), clean old content first
+    # but preserve the .monorepo.json marker.
     if (Test-Path $TargetPath) {
         Get-ChildItem -Path $TargetPath -Exclude '.monorepo.json' | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    } else {
+        New-Item -ItemType Directory -Path $TargetPath -Force | Out-Null
     }
-    Copy-Item -Path $subDir -Destination $TargetPath -Recurse -Force
+    # Copy the contents of $subDir (not the directory itself) into $TargetPath.
+    # Using `Copy-Item -Path $subDir -Destination $TargetPath -Recurse` when
+    # $TargetPath already exists nests $subDir as a child (~/.psmux/plugins/<name>/<name>/),
+    # which breaks plugin loading. Enumerate children to merge instead.
+    Get-ChildItem -Path $subDir -Force | Copy-Item -Destination $TargetPath -Recurse -Force
 
-    # Create a .monorepo marker so Update-Plugin knows how to update this
-    @{
+    # Create a .monorepo marker so Update-Plugin knows how to update this.
+    # The optional 'branch' field is persisted only when a branch was specified
+    # at install time, so subsequent updates pull from the same ref.
+    $metaHash = @{
         monorepo = $monorepo
         org      = $Org
         name     = $Name
         url      = $cloneUrl
-    } | ConvertTo-Json | Set-Content (Join-Path $TargetPath '.monorepo.json') -Encoding UTF8
+    }
+    if ($Branch) { $metaHash.branch = $Branch }
+    $metaHash | ConvertTo-Json | Set-Content (Join-Path $TargetPath '.monorepo.json') -Encoding UTF8
 
     # Clean up temp dir
     Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
@@ -300,12 +357,29 @@ function Install-Plugin {
         return $true
     }
 
-    Write-Host "  Installing: $($info.Name) ..." -ForegroundColor Cyan
+    $branchNote = if ($info.Branch) { " (branch: $($info.Branch))" } else { "" }
+    Write-Host "  Installing: $($info.Name)$branchNote ..." -ForegroundColor Cyan
 
-    # Try direct git clone first
+    # 3-segment specs (owner/monorepo/subdir): route directly to monorepo extraction.
+    # No probe, no MONOREPO_MAP lookup - the source is self-described in the spec.
+    if ($info.MonorepoSource) {
+        if (Install-FromMonorepo -Org $info.Org -Name $info.SubdirName -TargetPath $info.Path -Source $info.MonorepoSource -Branch $info.Branch) {
+            Write-Host "  Installed: $($info.Name)" -ForegroundColor Green
+            Initialize-Plugin $info.Path
+            Persist-PluginActivation -Spec $Spec -PluginPath $info.Path
+            return $true
+        }
+        Write-Host "  FAILED: $($info.Name) - could not install from $($info.MonorepoSource) subdir $($info.SubdirName)" -ForegroundColor Red
+        return $false
+    }
+
+    # 2-segment / URL / bare name: try direct git clone first.
     $cloned = $false
     try {
-        git clone --depth 1 $info.Url $info.Path 2>&1 | Out-Null
+        $cloneArgs = @('clone', '--depth', '1')
+        if ($info.Branch) { $cloneArgs += @('--branch', $info.Branch) }
+        $cloneArgs += @($info.Url, $info.Path)
+        & git @cloneArgs 2>&1 | Out-Null
         if (Test-Path $info.Path) { $cloned = $true }
     } catch {}
 
@@ -313,7 +387,7 @@ function Install-Plugin {
     if (-not $cloned -and $info.Org -and $script:MONOREPO_MAP.ContainsKey($info.Org)) {
         # Remove any partial clone artifacts
         if (Test-Path $info.Path) { Remove-Item -Recurse -Force $info.Path -ErrorAction SilentlyContinue }
-        $cloned = Install-FromMonorepo -Org $info.Org -Name $info.Name -TargetPath $info.Path
+        $cloned = Install-FromMonorepo -Org $info.Org -Name $info.Name -TargetPath $info.Path -Branch $info.Branch
     }
 
     if ($cloned -and (Test-Path $info.Path)) {
@@ -348,10 +422,15 @@ function Update-Plugin {
     $monorepoJson = Join-Path $PluginPath '.monorepo.json'
     if (Test-Path $monorepoJson) {
         $meta = Get-Content $monorepoJson -Raw | ConvertFrom-Json
-        Write-Host "  Updating: $name (from monorepo $($meta.monorepo)) ..." -ForegroundColor Cyan
+        $metaBranch = $meta.branch
+        $branchNote = if ($metaBranch) { " branch '$metaBranch'" } else { "" }
+        Write-Host "  Updating: $name (from monorepo $($meta.monorepo)$branchNote) ..." -ForegroundColor Cyan
         $tmpDir = Join-Path $env:TEMP "ppm-monorepo-$($meta.org)-$(Get-Random)"
         try {
-            git clone --depth 1 $meta.url $tmpDir 2>&1 | Out-Null
+            $cloneArgs = @('clone', '--depth', '1')
+            if ($metaBranch) { $cloneArgs += @('--branch', $metaBranch) }
+            $cloneArgs += @($meta.url, $tmpDir)
+            & git @cloneArgs 2>&1 | Out-Null
             $subDir = Join-Path $tmpDir $meta.name
             if (Test-Path $subDir) {
                 # Remove old contents (except .monorepo.json) and copy new
@@ -381,16 +460,40 @@ function Update-Plugin {
         return
     }
 
-    # No .git and no .monorepo.json — try monorepo fallback from spec or name
+    # No .git and no .monorepo.json — try to derive the source from $Spec.
+    # Parse optional '#branch' suffix and the spec shape.
+    $specBase = $Spec
+    $specBranch = $null
+    if ($specBase -and $specBase -match '^([^#]+)#(.+)$') {
+        $specBase = $Matches[1]
+        $specBranch = $Matches[2]
+    }
+
+    # 3-segment spec: explicit monorepo source, no MONOREPO_MAP needed.
+    if ($specBase -and $specBase -match '^([^/]+)/([^/]+)/([^/]+)$') {
+        $sOwner = $Matches[1]
+        $sRepo  = $Matches[2]
+        $sSubdir = $Matches[3]
+        $branchNote = if ($specBranch) { " branch '$specBranch'" } else { "" }
+        Write-Host "  Updating: $name (3-segment monorepo $sOwner/$sRepo$branchNote) ..." -ForegroundColor Cyan
+        if (Install-FromMonorepo -Org $sOwner -Name $sSubdir -TargetPath $PluginPath -Source "$sOwner/$sRepo" -Branch $specBranch) {
+            Write-Host "  Updated: $name" -ForegroundColor Green
+        } else {
+            Write-Host "  FAILED: $name - 3-segment update failed" -ForegroundColor Red
+        }
+        return
+    }
+
+    # 2-segment / bare-name fallback via MONOREPO_MAP
     $org = $null
-    if ($Spec -and $Spec -match '^([^/]+)/') { $org = $Matches[1] }
+    if ($specBase -and $specBase -match '^([^/]+)/') { $org = $Matches[1] }
     if (-not $org) {
         # Guess the org from known psmux plugin name patterns
         if ($name -match '^psmux-') { $org = 'psmux-plugins' }
     }
     if ($org -and $script:MONOREPO_MAP.ContainsKey($org)) {
         Write-Host "  Updating: $name (monorepo fallback) ..." -ForegroundColor Cyan
-        if (Install-FromMonorepo -Org $org -Name $name -TargetPath $PluginPath) {
+        if (Install-FromMonorepo -Org $org -Name $name -TargetPath $PluginPath -Branch $specBranch) {
             Write-Host "  Updated: $name" -ForegroundColor Green
         } else {
             Write-Host "  FAILED: $name - monorepo fallback failed" -ForegroundColor Red
@@ -475,8 +578,7 @@ function Update-AllPlugins {
         $specByName[$pname] = $spec
     }
 
-    $dirs = Get-ChildItem -Path $PLUGIN_DIR -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -ne 'ppm' }
+    $dirs = Get-ChildItem -Path $PLUGIN_DIR -Directory -ErrorAction SilentlyContinue
 
     if ($dirs.Count -eq 0) {
         Write-Host "  No plugins to update." -ForegroundColor DarkGray
@@ -507,6 +609,12 @@ function Remove-UnusedPlugins {
     Write-Host "PPM - Cleaning unused plugins..." -ForegroundColor Magenta
     Write-Host ("=" * 50) -ForegroundColor Magenta
 
+    # Skip the PPM directory itself when scanning for unused plugins. Matches
+    # tpm's pattern in scripts/clean_plugins.sh (`[ "${plugin}" = "tpm" ] && continue`):
+    # never remove the plugin manager regardless of whether the user has declared
+    # `set -g @plugin 'psmux-plugins/ppm'` in their config. If they removed that
+    # line, this guard prevents the clean pass from deleting the directory
+    # containing the currently-running script.
     $dirs = Get-ChildItem -Path $PLUGIN_DIR -Directory -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -ne 'ppm' }
 
@@ -567,6 +675,13 @@ Register-PPMBindings
 $declaredPlugins = Get-DeclaredPlugins
 $declaredNames = $declaredPlugins | ForEach-Object { ($_ -split '/')[-1] }
 
+# Source only plugins that are declared in config (not every directory).
+# The `$_.Name -ne 'ppm'` filter is a PPM-specific divergence from tpm: tpm
+# has no analogous startup-source loop (its plugin sourcing is integrated
+# into tpm.tmux's main script flow, so re-entry is impossible by design).
+# PPM runs sourcing as a separate pass after bootstrap, so the guard prevents
+# PPM from re-sourcing itself when the user has declared
+# `set -g @plugin 'psmux-plugins/ppm'` in their config.
 $installedPlugins = Get-ChildItem -Path $PLUGIN_DIR -Directory -ErrorAction SilentlyContinue |
                     Where-Object { $_.Name -ne 'ppm' -and $_.Name -in $declaredNames }
 

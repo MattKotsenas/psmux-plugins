@@ -13,14 +13,130 @@ $ErrorActionPreference = 'Continue'
 $env:PSMUX_ALLOW_NESTING = '1'
 
 function Get-PsmuxBin {
+    # Test-mode override: env var pointing to a wrapper script/exe to use
+    # instead of the discovered binary. Lets isolation tests redirect every
+    # psmux invocation to a wrapper that adds -L <test-socket>.
+    if ($env:PSMUX_BIN_OVERRIDE) { return $env:PSMUX_BIN_OVERRIDE }
     foreach ($n in @('psmux','pmux','tmux')) {
         $b = Get-Command $n -ErrorAction SilentlyContinue
-        if ($b) { return $b.Source }
+        if ($b -and $b.Source) { return $b.Source }
     }
     return 'psmux'
 }
 
 $PSMUX = Get-PsmuxBin
+
+# --- Singleton guard -------------------------------------------------------
+# Restore is a long-running, NON-idempotent operation: it issues new-window
+# calls for each saved window. Concurrent invocations interleave their
+# new-window calls and double (or worse) the resulting window count.
+#
+# This is observable in the wild because:
+#   * psmux-continuum's session-created hook fires for every new-session,
+#     including the ones THIS script issues. Its option-based TOCTOU
+#     singleton (@continuum-restore-fired) can let two auto_restore.ps1
+#     invocations through under tight timing at server boot.
+#   * Future user hooks / manual bindings can also re-enter.
+#
+# Process-level PID-file singleton matches the auto_save.ps1 approach
+# (psmux-plugins#13 / Cosmin's fix). Atomic CreateNew on the PID file
+# guarantees that exactly one restore loop ever proceeds at a time; any
+# concurrent invocations exit cleanly without touching state.
+#
+# Test override: PSMUX_RESTORE_PID_FILE_OVERRIDE lets the Pester test suite
+# point at a tempdir-local PID file so we don't collide with a real plugin
+# install on the same machine.
+$RESTORE_PID_FILE = if ($env:PSMUX_RESTORE_PID_FILE_OVERRIDE) {
+    $env:PSMUX_RESTORE_PID_FILE_OVERRIDE
+} else {
+    Join-Path $env:LOCALAPPDATA 'psmux-continuum\restore.pid'
+}
+$pidDir = Split-Path $RESTORE_PID_FILE -Parent
+if (-not (Test-Path $pidDir)) {
+    New-Item -ItemType Directory -Path $pidDir -Force | Out-Null
+}
+
+# Atomic claim: try to create the file with CreateNew. If it exists and
+# the recorded PID is still alive, another restore is in progress; exit.
+# If it exists but the recorded PID is dead, the slot is stale (previous
+# restore crashed) — reclaim atomically by deleting + retrying CreateNew.
+# Bounded retries so we don't spin if two processes are both trying to
+# reclaim the same dead slot (the second one will see the first's live PID
+# on its second pass and exit cleanly).
+$claimedSlot = $false
+$ownPid = $PID
+$MaxClaimAttempts = 3
+for ($attempt = 0; $attempt -lt $MaxClaimAttempts; $attempt++) {
+    try {
+        $fs = [System.IO.File]::Open(
+            $RESTORE_PID_FILE,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::Read
+        )
+        try {
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($ownPid.ToString())
+            $fs.Write($bytes, 0, $bytes.Length)
+        } finally {
+            $fs.Dispose()
+        }
+        $claimedSlot = $true
+        break
+    } catch [System.IO.IOException] {
+        # File already exists. Inspect the recorded PID.
+        $stalePid = $null
+        try { $stalePid = [int]((Get-Content $RESTORE_PID_FILE -Raw).Trim()) } catch {}
+
+        # Verify the recorded PID belongs to a pwsh process (the only thing
+        # that should be running restore.ps1). PIDs are reused on Windows;
+        # a bare Get-Process check can false-positive when the kernel has
+        # recycled the PID to a different process. Checking the image name
+        # narrows the window dramatically.
+        $aliveOwner = $null
+        if ($stalePid) {
+            $proc = Get-Process -Id $stalePid -EA SilentlyContinue
+            if ($proc -and ($proc.Name -in @('pwsh', 'powershell'))) {
+                $aliveOwner = $proc
+            }
+        }
+        if ($aliveOwner) {
+            Write-Host "psmux-resurrect: another restore is already running (PID $stalePid); exiting." -ForegroundColor DarkGray
+            exit 0
+        }
+        # Stale slot — delete and retry CreateNew. The delete + retry pattern
+        # avoids the TOCTOU race on Set-Content: if another process is also
+        # reclaiming, only one will succeed at CreateNew; the other will see
+        # the first's live PID on the next iteration and exit.
+        try {
+            Remove-Item $RESTORE_PID_FILE -Force -ErrorAction Stop
+        } catch {
+            # Someone else may have just deleted it; loop will retry CreateNew.
+        }
+        Start-Sleep -Milliseconds 25
+    }
+}
+if (-not $claimedSlot) {
+    Write-Host "psmux-resurrect: could not claim singleton slot after $MaxClaimAttempts attempts; exiting." -ForegroundColor DarkGray
+    exit 0
+}
+
+# Ensure we release the slot on any exit path (success, error, ctrl-C).
+$releaseSlot = {
+    if ($claimedSlot -and (Test-Path $RESTORE_PID_FILE)) {
+        # Only delete if we're still the owner (PID matches). If someone
+        # else claimed it after we set up but before we got here, leave
+        # their claim alone.
+        try {
+            $currentOwner = [int]((Get-Content $RESTORE_PID_FILE -Raw).Trim())
+            if ($currentOwner -eq $ownPid) {
+                Remove-Item $RESTORE_PID_FILE -Force -ErrorAction SilentlyContinue
+            }
+        } catch {
+            Remove-Item $RESTORE_PID_FILE -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+# --- End singleton guard ---------------------------------------------------
 
 # Plugin root (this file lives in <plugin>/scripts/)
 $PLUGIN_DIR = Split-Path $PSScriptRoot -Parent
@@ -152,12 +268,34 @@ try {
 
         Show-Progress -current ($si + 1) -total $totalSessions -sessionName $sessionName
 
-        # Check if session already exists (idempotent)
+        # Check if session already exists. The original behavior was to skip
+        # entirely, which lost data on psmux server startup: the server
+        # creates a default empty session, this script saw it existed, and
+        # `continue`'d past all the saved windows. Refactor to pane-level
+        # reconciliation: when the existing session is the empty default
+        # (exactly 1 window with 1 pane — no user state to preserve), reuse
+        # it as the target for the saved content. Only when the session has
+        # actual user state (multiple windows OR multiple panes) do we skip.
+        $reuseExisting = $false
         $null = & $PSMUX has-session -t $sessionName 2>&1
         if ($LASTEXITCODE -eq 0) {
-            Write-Host "  Session '$sessionName' already exists, skipping" -ForegroundColor Yellow
-            $skipped += $sessionName
-            continue
+            # Session exists. Inspect its content to decide reuse vs. skip.
+            $existingWindowsRaw = & $PSMUX list-windows -t $sessionName -F '#{window_index}' 2>&1
+            $existingWindows = @($existingWindowsRaw | Where-Object { $_ -match '^\d+$' })
+            $existingPanesRaw = & $PSMUX list-panes -t $sessionName -F '#{pane_index}' 2>&1
+            $existingPanes = @($existingPanesRaw | Where-Object { $_ -match '^\d+$' })
+
+            if ($existingWindows.Count -eq 1 -and $existingPanes.Count -eq 1) {
+                # Empty default state (one window, one pane — the
+                # auto-created shell with nothing in it). Safe to reuse.
+                $reuseExisting = $true
+                Write-Host "  Session '$sessionName' is empty default; reusing for restore" -ForegroundColor DarkGray
+            } else {
+                # User has been working in this session; preserve their state.
+                Write-Host "  Session '$sessionName' has user state ($($existingWindows.Count) windows, $($existingPanes.Count) panes total); skipping" -ForegroundColor Yellow
+                $skipped += $sessionName
+                continue
+            }
         }
 
         # Create session with first window
@@ -168,20 +306,32 @@ try {
             $env:USERPROFILE
         }
 
-        # Use the saved window name for the initial window
-        & $PSMUX new-session -d -s $sessionName -c $firstDir $(if ($firstWindow.name) { @('-n', $firstWindow.name) } else { @() }) 2>&1 | Out-Null
+        if ($reuseExisting) {
+            # Reuse existing session: don't create, just rename the existing
+            # window to match the saved name and use it as the first window.
+            if ($firstWindow.name) {
+                # Determine the existing window index, then rename it.
+                $existingWinIdx = (& $PSMUX list-windows -t $sessionName -F '#{window_index}' 2>&1 | Out-String).Trim()
+                if ($existingWinIdx -match '^\d+$') {
+                    & $PSMUX rename-window -t "${sessionName}:${existingWinIdx}" $firstWindow.name 2>&1 | Out-Null
+                }
+            }
+        } else {
+            # Use the saved window name for the initial window
+            & $PSMUX new-session -d -s $sessionName -c $firstDir $(if ($firstWindow.name) { @('-n', $firstWindow.name) } else { @() }) 2>&1 | Out-Null
 
-        # Wait for session to be ready
-        $ready = $false
-        for ($w = 0; $w -lt 40; $w++) {
-            Start-Sleep -Milliseconds 250
-            $null = & $PSMUX has-session -t $sessionName 2>&1
-            if ($LASTEXITCODE -eq 0) { $ready = $true; break }
-        }
-        if (-not $ready) {
-            Write-Host "  Failed to create session '$sessionName'" -ForegroundColor Red
-            $failed += $sessionName
-            continue
+            # Wait for session to be ready
+            $ready = $false
+            for ($w = 0; $w -lt 40; $w++) {
+                Start-Sleep -Milliseconds 250
+                $null = & $PSMUX has-session -t $sessionName 2>&1
+                if ($LASTEXITCODE -eq 0) { $ready = $true; break }
+            }
+            if (-not $ready) {
+                Write-Host "  Failed to create session '$sessionName'" -ForegroundColor Red
+                $failed += $sessionName
+                continue
+            }
         }
 
         # Get the actual base index used by the new session
@@ -309,4 +459,5 @@ try {
 finally {
     Clear-ResurrectStatus
     & $PSMUX refresh-client -S 2>&1 | Out-Null
+    & $releaseSlot
 }

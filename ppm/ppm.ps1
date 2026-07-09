@@ -178,6 +178,18 @@ function Resolve-PluginSpec {
     }
 }
 
+# --- Derive a plugin's local directory name from its @plugin spec ---
+# Strips any '#branch' suffix before taking the final path segment. Branch names
+# may contain '/' (e.g. 'temp/integration'), so a naive ($spec -split '/')[-1]
+# returns the branch tail ('integration') instead of the plugin name, which
+# breaks the startup sourcing filter, the update name->spec lookup, and the
+# unused-plugin clean pass. Mirrors Resolve-PluginSpec's own name derivation.
+function Get-PluginName {
+    param([string]$Spec)
+    $base = ($Spec -split '#', 2)[0]
+    return (($base -split '[/:]')[-1]) -replace '\.git$', ''
+}
+
 # --- Clone from monorepo fallback ---
 # When the individual repo clone fails and the org is in MONOREPO_MAP,
 # clone the full monorepo to a temp directory and extract just the
@@ -553,7 +565,7 @@ function Install-AllPlugins {
 
     $installed = 0
     foreach ($spec in $plugins) {
-        $name = ($spec -split '/')[-1]
+        $name = Get-PluginName $spec
         Show-PpmStatus "PPM: Installing $name..."
         if (Install-Plugin $spec) { $installed++ }
     }
@@ -574,7 +586,7 @@ function Update-AllPlugins {
     $declaredPlugins = Get-DeclaredPlugins
     $specByName = @{}
     foreach ($spec in $declaredPlugins) {
-        $pname = ($spec -split '/')[-1]
+        $pname = Get-PluginName $spec
         $specByName[$pname] = $spec
     }
 
@@ -602,7 +614,7 @@ function Update-AllPlugins {
 # --- Main: Clean unused plugins ---
 function Remove-UnusedPlugins {
     $plugins = Get-DeclaredPlugins
-    $declaredNames = $plugins | ForEach-Object { ($_ -split '/')[-1] }
+    $declaredNames = $plugins | ForEach-Object { Get-PluginName $_ }
 
     Show-PpmStatus "PPM: Cleaning unused plugins..."
     Write-Host ""
@@ -673,7 +685,7 @@ Register-PPMBindings
 
 # Source only plugins that are declared in config (not every directory)
 $declaredPlugins = Get-DeclaredPlugins
-$declaredNames = $declaredPlugins | ForEach-Object { ($_ -split '/')[-1] }
+$declaredNames = $declaredPlugins | ForEach-Object { Get-PluginName $_ }
 
 # Source only plugins that are declared in config (not every directory).
 # The `$_.Name -ne 'ppm'` filter is a PPM-specific divergence from tpm: tpm

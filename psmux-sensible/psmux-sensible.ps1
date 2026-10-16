@@ -26,8 +26,9 @@ $PSMUX = Get-PsmuxBin
 # --- Sensible defaults (all use -go so user overrides are respected) ---
 
 # Reduce escape-time for faster key recognition (tmux-sensible uses 0, but
-# 50ms is safer on Windows to avoid swallowing escape sequences)
-& $PSMUX set -go escape-time 50 2>&1 | Out-Null
+# psmux now passes a real Escape key press through at once and uses escape-time
+# only for ambiguous byte input, so 10 ms, the tmux 3.5+ default, is safe)
+& $PSMUX set -go escape-time 10 2>&1 | Out-Null
 
 # Increase scrollback buffer
 & $PSMUX set -go history-limit 50000 2>&1 | Out-Null

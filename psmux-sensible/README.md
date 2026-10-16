@@ -12,7 +12,7 @@ set -g @plugin 'psmux-plugins/psmux-sensible'
 
 | Option | Value | Why |
 |--------|-------|-----|
-| `escape-time` | 50 | Faster key response |
+| `escape-time` | 10 | Faster key response |
 | `history-limit` | 50000 | More scrollback |
 | `mouse` | on | Mouse support enabled |
 | `mode-keys` | vi | Vi copy-mode keys |

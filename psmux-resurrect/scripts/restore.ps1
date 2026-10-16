@@ -164,7 +164,7 @@ try {
     # name through psmux, since the hook's routing name can include a namespace.
     $initialSessionName = $null
     if ($InitialSession -and -not $overwriteExisting) {
-        $names = @(& $PSMUX display-message -p -t $InitialSession '#{session_name}' 2>$null)
+        $names = @(& $PSMUX display-message -p -t "${InitialSession}:" '#{session_name}' 2>$null)
         if ($LASTEXITCODE -eq 0 -and $names.Count -eq 1) { $initialSessionName = $names[0] }
     }
 

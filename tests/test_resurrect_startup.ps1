@@ -135,7 +135,9 @@ try {
     [void]`$p.Start(); `$o = `$p.StandardOutput.ReadToEndAsync(); `$e = `$p.StandardError.ReadToEndAsync()
     if (-not `$p.WaitForExit(20000)) { `$p.Kill(`$true); throw 'Wrapper timeout' }
     `$text = `$o.GetAwaiter().GetResult()
-    if (`$text) { `$text.TrimEnd([char[]]"``r``n") -split "``r?``n" }
+    if (`$args[0] -eq 'list-panes' -and (`$args -join ' ').Contains('#{q:')) {
+        [Console]::Write(`$text)
+    } elseif (`$text) { `$text.TrimEnd([char[]]"``r``n") -split "``r?``n" }
     [Console]::Error.Write(`$e.GetAwaiter().GetResult()); exit `$p.ExitCode
 } finally { `$p.Dispose() }
 "@ | Set-Content (Join-Path $bin 'psmux.ps1')
